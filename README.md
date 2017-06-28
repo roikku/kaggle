@@ -1,6 +1,6 @@
 # Kaggle's Problems
 
-Playground where we address some machine learning problems from [Kaggle](https://www.kaggle.com). 
+Playground where some machine learning problems from [Kaggle](https://www.kaggle.com) are addressed.  
 
 ## Titanic: Machine Learning from Disaster
 
