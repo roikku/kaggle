@@ -1,0 +1,58 @@
+---
+title: 'A Complete Solution in 10 Lines of Code'
+author: 'Loic Merckel'
+date: '04 June 2017'
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    highlight: tango
+    theme: cosmo
+    smart: true
+---
+
+<style type="text/css">
+  h1.title { font-weight: bold; } h1 { font-weight: normal; } .author { font-weight: normal; font-size: 1.5em; }
+</style>
+
+
+```{r include=FALSE}
+# License -----------------
+
+# Copyright 2017 Loic Merckel
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+# http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+```
+
+Just for fun, we present a ten-lines-of-code solution to the Mercedes problem (all inclusive from data loading to result saving)... The result is not that great, though! (0.39339 on the LB, by setting the seed to 1)
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+require("caret")
+isOnKaggle <- FALSE
+if (isOnKaggle) {
+  X <- read.csv  (file.path("..", "input", "train.csv", fsep = .Platform$file.sep), header = TRUE)
+  Xt <- read.csv (file.path("..", "input", "test.csv", fsep = .Platform$file.sep), header = TRUE)
+} else {
+  X <- read.csv  (file.path(".", "data", "train.csv", fsep = .Platform$file.sep), header = TRUE)
+  Xt <- read.csv (file.path(".", "data", "test.csv", fsep = .Platform$file.sep), header = TRUE)
+}
+Xt$y <- NA
+X <- X[-which(X$y > 250), ]
+require("caret")
+XXt <- rbind(X[, c(setdiff(names(X),"y"), "y")], Xt[, c(setdiff(names(Xt),"y"), "y")])
+indexToIgnore <- which (names(X) %in% c("ID", "X0", "X1", "X2", "X3", "X4", "X5", "X6", "X8"))
+preProc <- preProcess(XXt[, -indexToIgnore], method = c("knnImpute", "center", "scale"), k = 5) 
+Xt$y <- ((predict(preProc, XXt[, -indexToIgnore])[["y"]] * sd(X$y)) + mean(X$y))[(nrow(X) + 1):(nrow(X) + nrow(Xt))]
+write.csv(data.frame(Id=Xt$ID, y=Xt$y), "result-knn.csv", row.names = FALSE,  quote = FALSE)
+```
+

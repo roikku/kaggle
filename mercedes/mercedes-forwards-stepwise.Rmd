@@ -1,0 +1,1005 @@
+---
+title: 'Greedy Selection & Boosting  (4 feat., > 0.55 LB)'
+author: 'Loic Merckel'
+date: '03 July 2017'
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    highlight: tango
+    theme: cosmo
+    smart: true
+---
+
+<style type="text/css">
+  h1.title { font-weight: bold; } h1 { font-weight: normal; } .author { font-weight: normal; font-size: 1.5em; }
+</style>
+
+
+```{r include=FALSE}
+# License -----------------
+
+# Copyright 2017 Loic Merckel
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+# http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+```
+
+
+After our arguably unsuccessful attempt at leveraging [PCA to reduce dimensionality](https://www.kaggle.com/merckel/preliminary-investigation-pca-boosting/), we present throughout this post another approach that consists in using a forward stepwise feature selection method to reduce the number of features.
+
+The feature tinkering part has been slightly improved compared to the one in our previous post ([Preliminary Investigation: PCA & Boosting](https://goo.gl/uM1FVS). Yet, as  stated there, preparing features is of critical importance, and we should definitely work harder on it to achieve better performance). The only difference here is that we removed one row for which the response time is suspiciously high.
+
+We found that with only **4** *basic*[^1] features, we can achieve the score of **0.55031** on Kaggle's LB (and with only **5** features, we obtained **0.55123**). That is quite surprising, especially given that, after a one-hot encoding of the categorical variables, there are over 550 features.
+
+[^1]: By *basic* features, we mean features that were there in the initial data set.
+
+
+Note that we rely on [XGBoost](http://xgboost.readthedocs.io/en/latest/) for the GBM training, in concert with our own simplistic implementation of a grid search. Due to severe limitations in computational resources, the grid only spans very narrow ranges for hyper-parameters (consequently, we might very well miss more adequate settings).
+
+
+
+```{r include=FALSE}
+pkgs <- c("corrplot", "car", "heplots", "plyr", "caret",
+          "dummies", "xgboost", "parallel", "Metrics") 
+for (pkg in pkgs) {
+  if (! (pkg %in% rownames(installed.packages()))) { install.packages(pkg) }
+  require(pkg, character.only = TRUE)
+}
+rm(pkgs)
+rm(pkg)
+```
+
+```{r include=FALSE}
+# data ---------------------------
+rm(list=ls(all=TRUE))
+
+getDataSet <- function (filePath) {
+  if(!file.exists(filePath)){
+    stop ("Error: the file cannot be found...")
+  }
+  if (grepl('zip$', filePath)) {
+    tmp <- unzip(filePath, exdir = dirname(filePath))
+    data <- read.csv(tmp, header = TRUE)
+    file.remove(tmp)
+    return (data)
+  } else {
+    return (read.csv(filePath, header = TRUE))
+  }
+}
+
+isOnKaggle <- FALSE
+if (isOnKaggle) {
+  X <- getDataSet (file.path("..", "input", "train.csv", fsep = .Platform$file.sep))
+  Xt <- getDataSet(file.path("..", "input", "test.csv", fsep = .Platform$file.sep))
+} else {
+  X <- getDataSet (file.path(".", "data", "train.csv", fsep = .Platform$file.sep))
+  Xt <- getDataSet(file.path(".", "data", "test.csv", fsep = .Platform$file.sep))
+}
+
+Xt$y <- NA
+
+# move the response to the end
+X <- X[, c(setdiff(names(X),"y"), "y")]
+Xt <- Xt[, c(setdiff(names(Xt),"y"), "y")]
+```
+
+```{r include=FALSE}
+# Settings ------------
+kFeaturesSelectionScoringMetric <- "r2"
+
+kOutputFolder <- file.path(".", fsep = .Platform$file.sep) 
+```
+
+```{r include=FALSE}
+saveOutPutCsv <- function (id, pred, file) {
+  res <- data.frame(Id=id)
+  res[["y"]] <- as.numeric(as.vector(pred))
+  write.csv(res, file=file, row.names = FALSE,  quote = FALSE)
+}
+
+isConstant <- function (x) {
+  return(all(duplicated(x)[-1L]))
+}
+
+getFormula <- function (response, features, factorResponse = TRUE) {
+  if (factorResponse) {
+    formulaStr <- paste0("factor(", response, ") ~ ")
+  } else {
+    formulaStr <- paste0(response, " ~ ")
+  }
+  first <- TRUE
+  for (str in features) {
+    if (first) {
+      first <- FALSE
+      formulaStr <- paste0(formulaStr, str)
+    } else {
+      formulaStr <- paste0(formulaStr, " + ", str)
+    }
+  }
+  return (as.formula(formulaStr))
+}
+
+rsquared <- function (y, predicted){
+  return (1 - sum((y-predicted)^2)/sum((y-mean(y))^2))
+}
+
+convertInteger2Numeric <- function (data) {
+  
+  for (c in names (data)) {
+    if (is.integer(data[[c]])) {
+      data[[c]] <- as.numeric(data[[c]])
+    }
+  }
+  return (data)
+}
+
+modelParam2String <- function (xgb) {
+  ret <- "params"
+  for (n in names(xgb$params)) {
+    if (n %in% c("nthread", "silent", "objective")) {
+      next
+    }
+    ret <- paste0(ret, "_", n, "-",  xgb$params[[n]])
+  }
+  return (ret)
+}
+
+saveResult <- function (ids, result, prefix) {
+  pathExt <- paste0("-", Sys.Date(), ".csv")
+  tryCatch({
+    
+    if(!file.exists(kOutputFolder)){
+      dir.create(kOutputFolder, showWarnings = FALSE, recursive = TRUE)
+    }
+    
+    path <- file.path(kOutputFolder, 
+                      paste0(prefix, pathExt), 
+                      fsep = .Platform$file.sep)
+    
+    saveOutPutCsv (ids, result, path)
+  }, error = function(e) {
+    print(e)
+  })
+  return (0)
+}
+```
+
+# Features Tinkering
+
+There are `r ncol(X)` features and only `r nrow(X)` rows in the training set. We might thus be interested in reducing the number of features.
+
+Since the features have been anonymized, it is rather unclear what those features are. A rapid analysis reveals no missing values; besides, many columns appear to be *quasi*-constant.
+
+```{r include=FALSE}
+toIgnore <- c("ID", "y")
+numVal <- c()
+nonNumVal <- c()
+for (feature in colnames(X)) {
+  if (feature %in% toIgnore) {
+    next
+  }
+  if (class(X[[feature]]) == "integer") {
+    if (sd(X[[feature]]) == 0) {
+      toIgnore <- c(toIgnore, feature)
+    } else {
+      numVal <- c(feature, numVal)
+    }
+  } else {
+    nonNumVal <- c(feature, nonNumVal)
+  }
+}
+```
+
+There are `r length(nonNumVal)` categorical variables, and `r length(numVal)` numerical variables with non-null standard deviation (those numerical values are either zero or one). The following graph reveals some correlation between the numerical features.
+
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=9}
+
+set.seed(1)
+toIgnore <- c("ID", "y")
+nrowx <- 4
+nrowy <- 4
+opar <- par(mfrow = c(nrowy, nrowx))
+for(i in 1:(nrowx * nrowy)) {
+  randomSample <- sample(numVal, 10, replace = FALSE, prob = NULL)
+  
+  correlations <- cor(X[, setdiff(randomSample, toIgnore)], use="everything")
+  corrplot(correlations, method="circle", type="lower",  sig.level = 0.01, insig = "blank", tl.cex = 0.7)
+}
+par(opar)
+```
+
+
+
+## Convert Categorical Variables to Numerical
+
+We use one-hot encoding.
+
+```{r echo=FALSE, , warning=FALSE, message=FALSE}
+fds <- rbind(X, Xt)
+numFds <- dummy.data.frame(
+  fds, 
+  names = nonNumVal, verbose = TRUE)
+
+numX <- numFds[1:nrow(X), ]
+numXt <- numFds[(nrow(X)+1):(nrow(X)+nrow(Xt)), ]
+```
+
+## Remove Constant Columns
+
+```{r include=FALSE}
+toRm <- c()
+for (c in names(numX)) {
+  if (isConstant(numX[[c]])) {
+    toRm <- c(toRm, c)
+  }
+}
+
+for (feature in toRm) {
+  numX[[feature]] <- NULL
+  numXt[[feature]] <- NULL
+}
+```
+
+The features `r paste(toRm, collapse=", ")` are constant in the training set, and thus dropped. There is a total of `r ncol(numX)` columns left.
+
+## Remove Outlier from Response
+
+
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=5}
+# with outlier
+opar <- par(fig=c(0, 0.5, 0, 0.8))
+hist(x = numX$y, breaks = 100, col = "forestgreen", plot = TRUE, xlab = "Response (time)", 
+     main = NULL)
+par(fig=c(0, 0.5, 0.50, 1), new = TRUE)
+boxplot(numX$y, col = "forestgreen", outcol="firebrick4", horizontal = TRUE, axes = FALSE)
+mtext("With the clear outlier", outer = FALSE, line=0)
+
+# without outlier
+par(fig=c(0.5, 1, 0, 0.8), new = TRUE)
+hist(x = numX[-which(numX$y > 250), ]$y, breaks = 100, col = "forestgreen", plot = TRUE, xlab = "Response (time)", 
+     main = NULL)
+par(fig=c(0.5, 1, 0.50, 1), new = TRUE)
+boxplot(numX[-which(numX$y > 250), ]$y, col = "forestgreen", outcol="firebrick4", horizontal = TRUE, axes = FALSE)
+mtext("Without the outlier", outer = FALSE, line=0)
+title("Histogram of Response", outer = TRUE, line=-2)
+par (opar)
+```
+
+
+The figure above (left) reveals a clear outlier with a response time above 250. Let's remove that likely spurious row. 
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+numX <- numX[-which(numX$y > 250), ]
+```
+
+The right chart shows the resulting distribution. 
+
+
+## Examine Possible Duplicated Rows
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+duplicatedRows <- duplicated(numX[, setdiff(names(numX), c("y", "ID"))])
+```
+
+There are `r sum(duplicatedRows)` rows with identical features (except for the `ID` and the response).
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+formula <- getFormula (
+  response = "y", 
+  features = setdiff(names(numX), c("y", "ID")),
+  factorResponse = FALSE)
+
+index <- 1
+duplicatedRowResponse <- list()
+aggNumX <- aggregate(formula, data = numX, drop = TRUE, 
+                     FUN = function (ys) {
+                       if (length(ys) > 1) {
+                         duplicatedRowResponse[[paste0(index)]] <- ys
+                         duplicatedRowResponse <<- duplicatedRowResponse
+                         index <<- index + 1
+                       }
+                       return(mean(ys))
+                     })
+```
+
+It is interesting to observe that with the exact same configuration the testing times differ (and quite significantly for certain configurations---as depicted by the figure below). This is perhaps due to the imperfection of the measuring device or perhaps human factors (tests not fully automated).
+
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=9}
+opar <- par(mfrow = c(3, 1), 
+            oma = c(5, 4, 2, 0) + 0.1,
+            mar = c(2.5, 0, 1, 1) + 0.1)
+for (i in 1:3) {
+  boxplot(duplicatedRowResponse[((i-1) * floor(length(duplicatedRowResponse)/3 + 1)):(i * floor(length(duplicatedRowResponse)/3))], 
+          ylab="Testing Time",
+          horizontal = FALSE,
+          col = "forestgreen")
+  if (i == 1) {
+    title(main = "Distribution of Testing Times for Identical Configurations",
+          xlab="Configuration Index",
+          outer = TRUE, line = 0)
+  }
+}
+par(opar)
+```
+
+
+The problem for our regression model is that such discrepancies might confuse the machine... (especially the number of rows is not that large...)
+  
+Let's aggregate those duplicated rows by identical features and set the response to the mean of their responses. Doing so, the already small number of rows further diminishes, but we might still gain from it.
+  
+One can remark that the IDs are lost, but we do not need them on the training set. Let's add a dummy column `ID` so that all data sets are consistent.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+  numX <- cbind(ID = 0, aggNumX) 
+```
+
+
+# Data Split
+
+```{r include=FALSE}
+unselect <- c("ID")
+response <- "y"
+predictors <- setdiff(names(numX), c(response, unselect)) 
+
+set.seed(1)
+```
+
+A validation set is extracted from the train set. We need a validation set (i) to assess the performance of subsets of features during the feature selection step, and subsequently (ii) to select the best models out of the grid search. 
+
+Given the rather small size of the data set, k-folds cross-validation (CV) might arguably constitute a better choice. However, the time required for a grid search on a MacBook becomes much longer with CV, to the point of being intractable. Ultimately, after selecting models using a fixed validation frame extracted from the training set, those models can (and should) be retrained using the entire training set.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+trainIndexes <- createDataPartition(y = numX[[response]], 
+                                    p = 0.7, 
+                                    list = FALSE) 
+
+train <- convertInteger2Numeric(numX[trainIndexes, ]) 
+valid <- convertInteger2Numeric(numX[-trainIndexes, ]) 
+test <- convertInteger2Numeric(numXt)
+```
+
+
+
+# Forward Stepwise Feature Selection
+
+We implement a forward stepwise algorithm (greedy algorithm), that does not guarantee the optimal subset of features, but that should yield a subset that performs well. To assess the performance of subsets, our implementation supports the coefficient of determination (r2), mean squared error (mse), root mean squared error (rmse) and root mean squared log error (rmsle). 
+
+```{r include=FALSE}
+getGreedyForwardlyBestFeaturesSet <- function (featuresSet, 
+                                               trainingFrame, 
+                                               response, 
+                                               newdata,
+                                               scoringMetric = "mse",
+                                               acceptSetBack = TRUE,
+                                               epsilon = 1e-6,
+                                               verbose = FALSE, 
+                                               seed = 1,
+                                               isPrecomputed =  FALSE) {
+  
+    drawfeaturesSelectionResult <<- function(historyTmpHighestScore, 
+                                           historyTmpHighestScoreIndex, 
+                                           historyHighestScore, 
+                                           historyHighestScoreIndex, 
+                                           historyTmpHighestScoreFeatures, 
+                                           ylab = "", 
+                                           legendPos = "bottomright") {
+    ylim <- c(min(historyTmpHighestScore), max(historyTmpHighestScore))
+    xlim <- c (min(historyTmpHighestScoreIndex), max(historyTmpHighestScoreIndex))
+    cex <- 0.9
+    inches2lines <- ( par("mar") / par("mai") )[1] #https://stackoverflow.com/questions/18040240/find-optimal-width-for-left-margin-in-r-plot
+    xmargin <- max(strwidth(historyTmpHighestScoreFeatures, 
+                            units="inches", 
+                            cex = cex)) * inches2lines
+    op <- par(mar = c(1 + xmargin, 4, 4, 2) + 0.1)
+    plot (x = historyHighestScoreIndex, y = historyHighestScore, 
+          type = "o", col="red", lwd=3, ylim = ylim, xlim = xlim, xaxt='n', xlab="", ylab=ylab,
+          main = "Greedy Forward Selection of Features")
+    par(new=TRUE)
+    plot (x = historyTmpHighestScoreIndex, y = historyTmpHighestScore, 
+          type = "o", col="green", xaxt='n', yaxt='n', ann=FALSE, ylim = ylim, xlim = xlim, xlab="")
+    axis(1, 
+         at = seq_along(historyTmpHighestScore), 
+         labels = as.character(historyTmpHighestScoreFeatures), 
+         las = 2, cex.axis = cex)
+    abline(v = max (historyHighestScoreIndex), col = "black", lty = 2)
+    # pos: 1=below, 2=left, 3=above, 4=right
+    ypos <- (ylim[1] + ylim[2]) / 2
+    if (grepl("^top", legendPos)) {
+      ypos <- ylim[1] + (ylim[2] - ylim[1]) * 0.9
+    } else if (grepl("^bottom", legendPos)) {
+      ypos <- ylim[1] + (ylim[2] - ylim[1]) * 0.1
+    }
+    rotation <- 0 # 90
+    text(x = max (historyHighestScoreIndex), y = ypos, "Selected", pos = 2, srt = rotation, col = "firebrick4")
+    text(x = max (historyHighestScoreIndex), y = ypos, "Ignored", pos = 4, srt = rotation, col = "forestgreen")
+    par(op)
+  }
+  
+  if (length(featuresSet) == 0) {
+    return (c())
+  }
+  validScoringMetric <- c("rmse", "rmsle", "mse", "r2")
+  if (!(scoringMetric %in% validScoringMetric)) {
+    stop(paste0("scoring metric can only be one of: ", validScoringMetric))
+  }
+  
+  getScoreValue <- function (scoringMetric, rmseValue, rmsleValue, mseValue, r2Value) {
+    ret <- ifelse(scoringMetric == "rmse", rmseValue, 
+                  ifelse(scoringMetric == "rmsle", rmsleValue, 
+                         ifelse(scoringMetric == "mse", mseValue, 
+                                ifelse(scoringMetric == "r2", r2Value, 
+                                       NA))))
+    if (is.na(ret)) {
+      stop ("Unknown scoring metric...")
+    }
+    return (ret)
+  }
+  
+  compareScoreValue <- function (scoringMetric, a, b, epsilon) {
+    
+    if (scoringMetric %in% c("r2")) {
+      return (a <= b + epsilon)
+    } else {
+      return (a >= b - epsilon)
+    }
+  }
+  
+  initValue <- function (scoringMetric) {
+    if (scoringMetric %in% c("r2")) {
+      return (0)
+    } else {
+      return (Inf)
+    }
+  }
+  
+  trainingFrame <- convertInteger2Numeric(trainingFrame)
+  newdata <- convertInteger2Numeric(newdata)
+  
+  set.seed(seed)
+  highestRmse <- initValue (scoringMetric = "rmse")
+  highestRmsle <- initValue (scoringMetric = "rmsle")
+  highestMse <- initValue (scoringMetric = "mse")
+  highestR2 <- initValue (scoringMetric = "r2")
+  bestFeatures <- c()
+  noImprovmentCount <- 0
+  noImprovmentFeatures <- c()
+  historyHighestScore <- c()
+  historyHighestScoreIndex <- c()
+  currIndex <- 0
+  historyTmpHighestScore <- c()
+  historyTmpHighestScoreIndex <- c()
+  historyTmpHighestScoreFeatures <- c()
+  finished <- FALSE
+  while (!finished) {
+    
+    bestNewFeatures <- NULL
+    
+    currIndex <- currIndex + 1
+    tmpHighestRmse <- initValue (scoringMetric = "rmse")
+    tmpHighestRmsle <- initValue (scoringMetric = "rmsle")
+    tmpHighestMse <- initValue (scoringMetric = "mse")
+    tmpHighestR2 <- initValue (scoringMetric = "r2")
+    tmpBestNewFeatures <- NULL
+    for (feature in setdiff(featuresSet, bestFeatures)) {
+      
+      currentFeatures <- c (bestFeatures, feature)
+
+      set.seed(seed)
+      xgb <- xgboost(
+        data = data.matrix(trainingFrame[, currentFeatures]),
+        label = trainingFrame[[response]],
+        max.depth = max(2, floor(sqrt(length(currentFeatures)))), 
+        eta = 0.01, 
+        nround = 500,
+        alpha = 0.02, 
+        gamma = 0,
+        colsample_bytree = 1, 
+        min_child_weight = 3, 
+        subsample = 0.7,
+        objective = "reg:linear",
+        seed = seed,
+        #nthread = parallel:::detectCores(),
+        verbose = FALSE,
+        print_every_n = 100,
+        save_period = NULL)
+      
+      validPred <- predict(xgb, data.matrix(newdata[, currentFeatures]))
+      r2 <- rsquared(y = newdata$y, validPred)
+      mse <- mean((newdata$y - validPred)^2)
+      rmse <- sqrt(mse)
+      rmsle <- rmsle(newdata$y, validPred)
+      
+      tmpScoreValue <- getScoreValue (scoringMetric = scoringMetric, 
+                                      rmsleValue = rmsle,
+                                      rmseValue = rmse,
+                                      mseValue = mse,
+                                      r2Value = r2)
+      
+      tmpHighestScoreValue <- getScoreValue (scoringMetric = scoringMetric, 
+                                             rmsleValue = tmpHighestRmsle,
+                                             rmseValue = tmpHighestRmse,
+                                             mseValue = tmpHighestMse,
+                                             r2Value = tmpHighestR2)
+      
+      if (compareScoreValue (scoringMetric = scoringMetric, 
+                             a = tmpHighestScoreValue, b = tmpScoreValue, 
+                             epsilon = 0)) {
+        tmpHighestRmse <- rmse 
+        tmpHighestRmsle <- rmsle
+        tmpHighestMse <- mse
+        tmpHighestR2 <- r2
+        tmpBestNewFeatures <- feature
+      }
+      if (verbose) {
+        print(paste0("Current feature: ", feature, " (", scoringMetric, ": ", tmpScoreValue, ")"))
+        print (currentFeatures)
+      }
+      if (isPrecomputed) {
+        break
+      }
+    }
+    historyTmpHighestScore <- c(historyTmpHighestScore, 
+                                getScoreValue (scoringMetric = scoringMetric, 
+                                               rmsleValue = tmpHighestRmsle,
+                                               rmseValue = tmpHighestRmse,
+                                               mseValue = tmpHighestMse,
+                                               r2Value = tmpHighestR2))
+    
+    historyTmpHighestScoreFeatures <- c(historyTmpHighestScoreFeatures, tmpBestNewFeatures)
+    historyTmpHighestScoreIndex <- c(historyTmpHighestScoreIndex, currIndex)
+    
+    highestScoreValue <- getScoreValue (scoringMetric = scoringMetric, 
+                                        rmsleValue = highestRmsle,
+                                        rmseValue = highestRmse,
+                                        mseValue = highestMse,
+                                        r2Value = highestR2)
+    
+    highestTmpScoreValue <- getScoreValue (scoringMetric = scoringMetric, 
+                                           rmsleValue = tmpHighestRmsle,
+                                           rmseValue = tmpHighestRmse,
+                                           mseValue = tmpHighestMse,
+                                           r2Value = tmpHighestR2)
+    
+    if (compareScoreValue (scoringMetric = scoringMetric, 
+                           a = highestScoreValue, b = highestTmpScoreValue, 
+                           epsilon = epsilon)) {
+      highestRmse <- tmpHighestRmse 
+      highestRmsle <- tmpHighestRmsle
+      highestMse <- tmpHighestMse
+      highestR2 <- tmpHighestR2
+      bestNewFeatures <- tmpBestNewFeatures
+      
+      historyHighestScore <- c(historyHighestScore, 
+                               getScoreValue (scoringMetric = scoringMetric, 
+                                              rmsleValue = highestRmsle,
+                                              rmseValue = highestRmse,
+                                              mseValue = highestMse,
+                                              r2Value = highestR2))
+      historyHighestScoreIndex <- c(historyHighestScoreIndex, currIndex)
+    }
+    if (is.null(bestNewFeatures)) {
+      if (!acceptSetBack || noImprovmentCount > 3) {
+        # no further improvement
+        bestFeatures <-  setdiff(bestFeatures, noImprovmentFeatures)
+        finished <- TRUE
+        break
+      } else {
+        noImprovmentCount <- noImprovmentCount + 1
+        noImprovmentFeatures <- c(noImprovmentFeatures, tmpBestNewFeatures)
+        
+        bestFeatures <- c(bestFeatures, tmpBestNewFeatures)
+      }
+    } else {
+      
+      bestFeatures <- c(bestFeatures, noImprovmentFeatures)
+      
+      noImprovmentCount <- 0
+      noImprovmentFeatures <- c()
+      
+      if (verbose) {
+        print(paste0("Best feature: ", bestNewFeatures, " (", 
+                     scoringMetric, ": ", 
+                     getScoreValue (scoringMetric = scoringMetric, 
+                                    rmsleValue = highestRmsle,
+                                    rmseValue = highestRmse,
+                                    mseValue = highestMse, 
+                                    r2Value = highestR2), ")"))
+      }
+      bestFeatures <- c(bestFeatures, bestNewFeatures)
+    }
+    if (length(setdiff(featuresSet, bestFeatures)) == 0) {
+      bestFeatures <-  setdiff(bestFeatures, noImprovmentFeatures)
+      finished <- TRUE
+      break 
+    }
+  }
+  if (verbose) {
+    print(bestFeatures)
+    print(paste0("rmse: ", highestRmse, ", rmsle: ", highestRmsle, 
+                 ", mse: ", highestMse, ", r2: ", highestR2))
+  }
+  
+  # "export" those variables to the global context,
+  # so that we can redraw the graph easily at the end
+  historyHighestScore <<- historyHighestScore
+  historyTmpHighestScore <<- historyTmpHighestScore
+  
+  historyHighestScoreIndex <<- historyHighestScoreIndex
+  historyTmpHighestScoreIndex <<- historyTmpHighestScoreIndex
+  historyTmpHighestScoreFeatures <<- historyTmpHighestScoreFeatures
+  
+  return (bestFeatures)
+}
+```
+
+It took several hours (on a MacBook) to get this set of features... To recompute it again by yourself, just change the flag `kUsePrecomputedFeatureSelection` to `FALSE`... And wait!
+
+```{r  echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+kUsePrecomputedFeatureSelection <- TRUE
+if (!kUsePrecomputedFeatureSelection) {
+  selectedFeatures <- getGreedyForwardlyBestFeaturesSet (
+    featuresSet = predictors, trainingFrame = train, response = response,
+    newdata =  valid, scoringMetric = kFeaturesSelectionScoringMetric,
+    acceptSetBack = TRUE, epsilon = 0.000001)
+}
+```
+
+```{r include=FALSE}
+
+if (kUsePrecomputedFeatureSelection) {
+  
+  precomputed <- c("X314", "X189", "X315", "X119", "X47", "X0ap", "X279", "X5n", 
+                 "X350", "X201", "X365", "X1l", "X322", "X360", "X127", "X64", 
+                 "X6e", "X8j", "X6j", "X6j", "X6d", "X5r", "X313", "X313", 
+                 "X1h", "X180", "X8a", "X131", "X131", "X8n", "X5q", "X5q", 
+                 "X0ax", "X0n", "X8l", "X0n", "X8l", "X5ah", "X135", "X1t", 
+                 "X354", "X5aa", "X340", "X174", "X3c", "X340", "X174", "X3c", 
+                 "X312", "X2e", "X8d", "X244", "X8d", "X244", "X0z", "X26", 
+                 "X261", "X286", "X284", "X385")
+
+  selected <- c("X314", "X189", "X315", "X119", "X47", "X0ap", "X279", "X5n", 
+                "X350", "X201", "X365", "X1l", "X322", "X360", "X127", "X64", 
+                "X6e", "X8j", "X6j", "X6d", "X5r", "X313", "X1h", "X180", 
+                "X8a", "X131", "X8n", "X5q", "X0ax", "X0n", "X8l", "X5ah", 
+                "X135", "X1t", "X354", "X5aa", "X340", "X174", "X3c", "X312", 
+                "X2e", "X8d", "X244", "X0z") 
+
+  # this will time out on kaggle, so we hard coded the results...
+  #selectedFeatures <- getGreedyForwardlyBestFeaturesSet (
+  #  featuresSet = precomputed, trainingFrame = train, response = response,
+  #  newdata =  valid, scoringMetric = kFeaturesSelectionScoringMetric,
+  #  acceptSetBack = TRUE, epsilon = 0.000001, isPrecomputed = TRUE)
+  
+  # this will define the drawfeaturesSelectionResult function
+  getGreedyForwardlyBestFeaturesSet (
+   featuresSet = c(), trainingFrame = NULL, response = NULL,
+   newdata =  NULL, scoringMetric = NULL)
+  
+  historyHighestScore <- c(0.3835008, 0.4854863, 0.5411516, 0.5934369, 0.6012819, 0.6014420, 0.6034897, 0.6042637, 0.6072846)
+   historyTmpHighestScore<- c(0.3835008, 0.4854863, 0.5411516, 0.5934369, 0.6012819, 0.6014420, 0.6034897, 0.6042637, 0.6072846, 0.6061219, 0.6053650, 0.6064166, 0.6061207, 0.6066135)
+   historyHighestScoreIndex <- c(1, 2, 3, 4, 5, 6, 7, 8, 9)
+   historyTmpHighestScoreIndex <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+   historyTmpHighestScoreFeatures <- c("X314", "X189", "X315", "X119", "X47", "X0ap", "X279", "X5n", "X350", "X201", "X365", "X1l", "X322", "X360")
+   selectedFeatures <- c("X314", "X189", "X315", "X119", "X47", "X0ap", "X279", "X5n", "X350")
+} 
+```
+
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=10, fig.height=5}
+if (exists("drawfeaturesSelectionResult")) {
+  legendPos <- "bottomright"
+  if (kFeaturesSelectionScoringMetric %in% c ("mse", "rmse", "rmsle")) {
+    legendPos <- "topright"
+  }
+  drawfeaturesSelectionResult (
+    historyTmpHighestScore = historyTmpHighestScore, 
+    historyTmpHighestScoreIndex = historyTmpHighestScoreIndex, 
+    historyHighestScore = historyHighestScore, 
+    historyHighestScoreIndex = historyHighestScoreIndex,
+    historyTmpHighestScoreFeatures = historyTmpHighestScoreFeatures,
+    ylab = kFeaturesSelectionScoringMetric, 
+    legendPos = legendPos)
+}
+```
+
+Here the set of selected features:
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+selectedFeatures
+```
+
+# Selected Features & Gradient Boosting Machine
+
+From the figure above (titled *Greedy Forward Selection of Features*), we can observe that the first four features (`r paste(selectedFeatures[1:4], collapse=",  ")`) contribute the most to a high coefficient of determination (r2), and in a notable way. Let's try to use those four feature only. 
+
+Note that we have also tried with: 
+
+* The first five features; although we got a better score on Kaggle's LB than with only four features, the two scores remain somewhat comparable---0.55031 vs. 0.55123.  
+* The entire selected set of features (i.e., `r length(selectedFeatures)` features). We did not submit the results on the LB; however, the validation result suggests a comparable outcome with only four or five features.
+
+Here we set the number of features we want to use.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+numberOfFeatures <- 4 #5, length(selectedFeatures)
+selectedFeatures <- selectedFeatures[1:numberOfFeatures]
+```
+
+Data sets preparation.
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+trainReduced <- convertInteger2Numeric(train[, c(selectedFeatures, "ID", response)])
+validReduced <- convertInteger2Numeric(valid[, c(selectedFeatures, "ID", response)])
+testReduced <- convertInteger2Numeric(test[, c(selectedFeatures, "ID", response)])
+```
+
+The three following vectors of indexes to ignore should be identical given that `ID` is consistently the first column and `response` the last one.  
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+indexToIgnoreTrain <- c(grep(paste0("^", response, "$"), names(trainReduced)), 
+                        grep("^ID$", names(trainReduced)))
+
+indexToIgnoreValid <- c(grep(paste0("^", response, "$"), names(validReduced)), 
+                        grep("^ID$", names(validReduced)))
+
+indexToIgnoreTest <- c(grep(paste0("^", response, "$"), names(testReduced)), 
+                        grep("^ID$", names(testReduced)))
+```
+
+```{r include=FALSE}
+seed <- 1
+set.seed(seed)
+```
+
+## Models Selection (Grid Search) Using a Validation Set
+
+```{r include=FALSE}
+# Here our simplistic grid search function
+gridSearch <- function (hyperParams, 
+                        train, indexToIgnoreTrain, 
+                        valid, indexToIgnoreValid,
+                        test, indexToIgnoreTest,
+                        response,
+                        verbose = TRUE, 
+                        seed = 1) {
+  grideSize <- prod (lengths(hyperParams))
+
+  bestR2 <- -Inf
+  count <- 0
+  xgbBest <- NULL
+  
+  validR2s <- c()
+  trainR2s <- c()
+  validMses <- c()
+  trainMses <- c()
+  predictions <- list()
+  models <- list()
+  predIndexes <- c()
+  
+  grid <- expand.grid(hyperParams)
+  for(i in 1:nrow(grid)) {
+    row <- grid[i, ]
+    
+    seed <- 1
+    set.seed(seed)
+    xgbTmp <- xgboost(
+      data = data.matrix(train[, -indexToIgnoreTrain]),
+      label = train[[response]],
+      max.depth = row$max_depth, 
+      eta = row$eta, 
+      nround = row$nround,
+      alpha = 0.02, 
+      gamma = row$gamma,
+      colsample_bytree = row$colsample_bytree, 
+      min_child_weight = row$min_child_weight, 
+      subsample = row$subsample,
+      objective = "reg:linear",
+      seed = seed,
+      #nthread = parallel:::detectCores(),
+      verbose = FALSE,
+      print_every_n = 200,
+      save_period = NULL)
+    
+    validPred <- predict(xgbTmp, data.matrix(valid[, -indexToIgnoreValid]))
+    r2 <- rsquared(y = valid$y, validPred)
+    if (bestR2 < r2) {
+      bestR2 <- r2
+      xgbBest <- xgbTmp
+    }
+    
+    validR2s <- c (validR2s, r2)
+    validMses <- c(validMses, mean((valid$y - validPred)^2))
+
+    trainPred <- predict(xgbTmp, data.matrix(train[, -indexToIgnoreTrain]))
+    trainR2s <- c(trainR2s, rsquared(y = train$y, trainPred))
+    trainMses <- c(trainMses, mean((train$y - trainPred)^2))
+        
+    predIndexes <- c(predIndexes, i)
+    predictions[[paste0(i)]] <- predict(xgbTmp, data.matrix(test[, -indexToIgnoreValid]))
+    models[[paste0(i)]] <- xgbTmp
+      
+    # progress
+    if (verbose) {
+      count <- count + 1
+      if (count == 1) {
+        print("Processing...")
+      }
+      if (count == grideSize) {
+        cat(": Done")
+        cat('\n')
+      } else {
+        cat('\r')
+        cat(paste0(round(count / grideSize * 100), "% completed",
+                   "; Current r2: ", format(r2, digits = 4), 
+                   "; Best r2 so far: ", format(bestR2, digits = 4)))
+      }
+    }
+  }
+  # add result columns to the grid
+  grid$validR2 <- validR2s
+  grid$trainR2 <- trainR2s
+  grid$validMse <- validMses
+  grid$trainMse <- trainMses
+  grid$index <- predIndexes
+  
+  # sort the grid
+  ordering <- order(grid$validR2, -grid$trainR2, decreasing = TRUE)
+  grid <- grid[ordering, ]
+  
+  ret <- list ()
+  ret$grid <- grid
+  ret$model <- xgbBest
+  ret$models <- models
+  ret$predictions <- predictions
+  
+  return (ret)
+}
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+hyperParams <- list ()
+
+hyperParams$nround <- c(800) 
+hyperParams$eta <- c(0.01)
+hyperParams$max_depth <- c(3, 4, 5)
+hyperParams$gamma <- c(0)
+hyperParams$colsample_bytree <- c(1)  
+hyperParams$min_child_weight <- c(1, 2, 3) 
+hyperParams$subsample <- c(0.7, 1)  
+
+gridSearchFsResult <- gridSearch (
+  hyperParams = hyperParams,
+  train = trainReduced, indexToIgnoreTrain = indexToIgnoreTrain,
+  valid = validReduced, indexToIgnoreValid = indexToIgnoreValid,
+  test = testReduced, indexToIgnoreTest = indexToIgnoreTest,
+  response = response,
+  verbose = TRUE)
+```
+
+```{r include=FALSE}
+# to improve visibility
+if (nrow(gridSearchFsResult$grid) > 1) {
+  for (c in names(gridSearchFsResult$grid)) {
+    if (isConstant(gridSearchFsResult$grid[[c]])) {
+      gridSearchFsResult$grid[[c]] <- NULL
+    }
+  }
+}
+```
+
+Here is the *head* of the sorted grid result---decreasingly by validR2 (r2 achieved on the validation set); then, increasingly by trainR2 (r2 achieved on the training set). The column *index* is just a way for us to retrieve the prediction associated with the row.
+
+```{r echo=FALSE}
+knitr::kable(head(gridSearchFsResult$grid, 10), row.names = FALSE)
+```
+
+A more extensive grid search could lead to improved performances, but we are quite limited in computational resources... It is worth noting that the small difference between the validation column (*validR2*) and the training column (*trainR2*) is rather a good sign (at least, it does not suggest a massive overfitting issue).
+
+## Retraining Best Models Using the Entire Training Set
+
+```{r include=FALSE}
+# We can submit to Kaggle's LB to see how well the best model (without retraining) performs on the test set.
+result <- predict(gridSearchFsResult$model, data.matrix(testReduced[, -indexToIgnoreTest]))
+saveResult(
+  Xt$ID, result, 
+  paste0("result-fs_nfeatures-", numberOfFeatures, "_", modelParam2String(gridSearchFsResult$model) ,
+         "_r2-", format(gridSearchFsResult$grid[1, ]$validR2, digits = 4)))
+```
+
+We retrain the best model using the entire data set (i.e., `rbind(train, valid)`) and can submit the resulting predictions to Kaggle's LB to see how well this model alone performs on the test set.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+retrainModel <- function (xgb, train, valid, indexToIgnore, response, seed = 1) {
+  set.seed(seed)
+  xgbRetrained <- xgboost(
+    data = data.matrix(
+      rbind(train, valid)[, -indexToIgnore]),
+    label = rbind(train, valid)[[response]],
+    max.depth = xgb$params$max_depth, 
+    eta = xgb$params$eta, 
+    nround = xgb$niter,
+    alpha = xgb$params$alpha, 
+    gamma = xgb$params$gamma,
+    colsample_bytree = xgb$params$colsample_bytree, 
+    min_child_weight = xgb$params$min_child_weight, 
+    subsample = xgb$params$subsample,
+    objective = xgb$params$objective,
+    seed = seed,
+    #nthread = parallel:::detectCores(),
+    verbose = TRUE,
+    print_every_n = 200,
+    save_period = NULL)
+  return (xgbRetrained)
+}
+```
+
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+finalFsModel <- retrainModel(
+  xgb = gridSearchFsResult$model, 
+  train = trainReduced, 
+  valid = validReduced,
+  indexToIgnore = indexToIgnoreTrain,
+  response = response,
+  seed = gridSearchFsResult$model$params$seed)
+
+resultRetrained <- predict(finalFsModel, data.matrix(testReduced[, -indexToIgnoreTest]))
+saveResult(Xt$ID, result, 
+           paste0("result-fs-retrained_nfeatures-", numberOfFeatures, "_", 
+                  modelParam2String(gridSearchFsResult$model)))
+```
+
+Finally, we can average the first few top-ranked models' predictions (we would expect a gain in performance).
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+numberOfModelsToAverage <- 6
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+averageAndSave <- function (ids, gridSearchResult, n, prefix, retrain = FALSE,
+                            train = NULL, valid = NULL, test = NULL, 
+                            indexToIgnore = NULL, response = NULL) {
+  grid <- gridSearchResult$grid
+  nPred <- min(n, nrow(grid))
+  predictions <- gridSearchResult$predictions
+  models <- gridSearchResult$models
+  for (i in 1:nPred) {
+    if (!retrain) {
+      preds <- predictions[[grid[i, ]$index]]
+    } else {
+      model <- models[[grid[i, ]$index]]
+      retrainedModel <- retrainModel(
+        xgb = model, train = train, valid = valid, indexToIgnore = indexToIgnore,
+        response = response, seed = model$params$seed)
+      
+      preds <- predict(retrainedModel, data.matrix(test[, -indexToIgnore]))
+    }
+    if (i == 1) {
+      aggregatedPredictions <- preds
+    } else {
+      aggregatedPredictions <- aggregatedPredictions + preds
+    }
+  }
+  aggregatedPredictions <- aggregatedPredictions / nPred
+  saveResult(ids, aggregatedPredictions, paste0(prefix, "n-", nPred))
+  return (aggregatedPredictions)
+}
+```
+
+Let's also submit those predictions to Kaggle's LB.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+a <- averageAndSave(Xt$ID, gridSearchFsResult, numberOfModelsToAverage, 
+                    paste0("result-fs-agg_nfeatures-", numberOfFeatures, "_"), 
+                    retrain = TRUE, valid = validReduced,  train = trainReduced, test = testReduced, 
+                    indexToIgnore = indexToIgnoreTrain, response = response)
+```
+
+```{r include=FALSE}
+```
