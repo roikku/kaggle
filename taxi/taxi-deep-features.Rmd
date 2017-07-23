@@ -1,0 +1,443 @@
+---
+title: 'Autoencoder and Deep Features'
+author: 'Loic Merckel'
+date: '22 July 2017'
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    highlight: tango
+    theme: cosmo
+    smart: true
+---
+
+<style type="text/css">
+  h1.title { font-weight: bold; } h1 { font-weight: normal; } .author { font-weight: normal; font-size: 1.5em; }
+</style>
+
+
+```{r include=FALSE}
+# License -----------------
+
+# Copyright 2017 Loic Merckel
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+# http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+```
+
+We use the autoencoder and deeplearning capability of the  [H<small>2</small>O](https://www.h2o.ai/) framework to explore deep features. 
+
+Such an approach provides a means of reducing features (although here there is no need, for the number of features is already small). 
+
+It also offers a way to leverage unlabelled data---a technique called semi-supervised learning. The kernels *[Diabolo Trick: Pre-train, Train and Solve](https://goo.gl/JXxc6n)* gives a concrete example.
+
+```{r include=FALSE}
+pkgs <- c("corrplot", "caret", "data.table", "plyr",
+          "xgboost", "parallel", "Metrics", "maps", 
+          "ggmap", "lubridate", "fasttime", "gridExtra") 
+for (pkg in pkgs) {
+  if (! (pkg %in% rownames(installed.packages()))) { install.packages(pkg) }
+  require(pkg, character.only = TRUE)
+}
+rm(pkgs)
+rm(pkg)
+```
+
+```{r include=FALSE}
+# data ---------------------------
+rm(list=ls(all=TRUE))
+
+kIsOnKaggle <- FALSE
+if (kIsOnKaggle) {
+  X <- fread(file.path("..", "input", "train.csv", fsep = .Platform$file.sep), 
+             header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+} else {
+  X <- fread(file.path(".", "data", "train.csv", fsep = .Platform$file.sep), 
+             header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+}
+```
+
+
+```{r include=FALSE}
+isConstant <- function (x) {
+  return(all(duplicated(x)[-1L]))
+}
+```
+
+# Features Tinkering
+
+First, we remove the column `dropoff_datetime`, as otherwise there is no point to predict the duration of the trip... We could just precisely calculate it...
+
+```{r  echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X[, dropoff_datetime := NULL]
+```
+
+```{r include=FALSE}
+toIgnore <- c("id", "trip_duration")
+```
+
+
+## Outliers
+
+### Pickup Location
+
+```{r echo=FALSE, warning=FALSE, results='hide', message=FALSE, out.width ="60%"}
+ggmapSupported <- TRUE
+tryCatch({
+map <- get_map(
+  location = c(lon = median(X$pickup_longitude), 
+               lat = 40.65), #median(X$pickup_latitude)
+  zoom = 11)
+
+outliers <- which(X$pickup_longitude > -74
+                  & X$pickup_latitude < 40.57)
+
+set.seed(1)
+nonOutlierSample <- sample(setdiff(seq(1, nrow(X)), outliers), 1000)
+
+ggmap(map) + 
+  geom_point(data = X[outliers, ],
+             aes(x = pickup_longitude, 
+                 y = pickup_latitude), color = "red", size = 4) + 
+  geom_point(data = X[nonOutlierSample, ],
+             aes(x = pickup_longitude, 
+                 y = pickup_latitude), color = "blue", size = 4, shape = 1)
+}, error = function(e) {
+  print (e)
+  ggmapSupported <<- FALSE
+})
+```
+
+`r if(!ggmapSupported) {"<img src=\"https://raw.githubusercontent.com/roikku/kaggle/master/taxi/img/map.png\" width=\"60%\"/>"}`
+
+```{r include=FALSE}
+rm(ggmapSupported)
+```
+
+There seems to be some outliers in the dataset. Let's remove *some* of them (obviously, a better way should be devised here, for the current naive implementation misses some outliers while removing some non-outliers).
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X <- X[-which(X$pickup_longitude > -74
+             & X$pickup_latitude < 40.57), ]
+```
+
+```{r include=FALSE}
+rm(map, outliers, nonOutlierSample)
+```
+
+### Trip Duration
+
+```{r include=FALSE}
+showOutliers <- function (X, column, maxVal, histTitle) {
+  # with outlier
+  opar <- par(fig=c(0, 0.5, 0, 0.8))
+  hist(x = X[[column]], breaks = 100, col = "forestgreen", plot = TRUE, xlab = column, 
+       main = NULL)
+  par(fig=c(0, 0.5, 0.50, 1), new = TRUE)
+  boxplot(X[[column]], col = "forestgreen", outcol="firebrick4", horizontal = TRUE, axes = FALSE)
+  mtext("With outliers", outer = FALSE, line=0)
+  
+  # without outlier
+  par(fig=c(0.5, 1, 0, 0.8), new = TRUE)
+  hist(x = X[-which(X[[column]] > maxVal), ][[column]], breaks = 100, col = "forestgreen", plot = TRUE, xlab = column, 
+       main = NULL)
+  par(fig=c(0.5, 1, 0.50, 1), new = TRUE)
+  boxplot(X[-which(X[[column]] > maxVal), ][[column]], col = "forestgreen", outcol="firebrick4", horizontal = TRUE, axes = FALSE)
+  mtext("Without outliers", outer = FALSE, line=0)
+  title(histTitle, outer = TRUE, line=-2)
+  par (opar)
+  return (0)
+}
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE, fig.width=10, fig.height=5}
+# outliers (Hampel's test)
+maxThreshold <- 3 * 1.48 * mad(X$trip_duration, na.rm = TRUE) 
+                    + median(X$trip_duration, na.rm = TRUE)  
+showOutliers(X, "trip_duration", maxThreshold, "Distribution of Trip Duration")
+```
+
+We rely on the Hampel's test to compute the maximum threshold above which values are declared spurious. One can find further details about the Hampel's test for outlier detection in *[Scrub data with scale-invariant nonlinear digital filters](http://m.eet.com/media/1140823/191159.pdf)*.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X <- X[-which(X$trip_duration > maxThreshold), ]
+```
+
+```{r include=FALSE}
+rm(maxThreshold)
+```
+
+## Pickup Date
+
+We add the two new features `wday` and `hour`.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X[, pickup_datetime := fastPOSIXct (pickup_datetime)]
+X[, wday := wday(pickup_datetime)]
+X[, hour := hour(pickup_datetime)]
+```
+
+```{r include=FALSE}
+toIgnore <- c(toIgnore, c("pickup_datetime"))
+```
+
+## Convert Categorical Variables to Numerical
+
+```{r include=FALSE}
+numVal <- c()
+nonNumVal <- c()
+for (feature in colnames(X)) {
+  if (feature %in% toIgnore) {
+    next
+  }
+  if (class(X[[feature]]) %in% c("integer", "numeric")) {
+    if (sd(X[[feature]]) == 0) {
+      toIgnore <- c(toIgnore, feature)
+    } else {
+      numVal <- c(feature, numVal)
+    }
+  } else {
+    nonNumVal <- c(feature, nonNumVal)
+  }
+}
+rm(feature)
+```
+
+There is `r length(nonNumVal)` categorical variables, and there are `r length(numVal)` numerical variables with non-null standard deviation. 
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+X[, store_and_fwd_flag := ifelse (store_and_fwd_flag == "N", 0, 1)]
+```
+
+
+# Deep Features
+
+## Convert to H2O Frames
+
+```{r include=FALSE}
+if (! ("h2o" %in% rownames(installed.packages()))) { install.packages("h2o") }
+require("h2o")
+
+tryCatch(
+  if (h2o.clusterIsUp()) {
+    h2o.shutdown(prompt=FALSE)
+    Sys.sleep(5)
+  }, error = function(e) {
+    
+  })
+
+h2o.init(nthreads = parallel:::detectCores(), 
+         max_mem_size = "15g", min_mem_size = "1g")
+h2o.removeAll()
+h2o.clusterStatus()
+```
+
+```{r include=FALSE}
+# We remove the column pickup_datetime because H2O does not handle POSIXct type, 
+# and we do not really need this column any longer (wday and hour are used instead)
+
+X[, pickup_datetime := NULL]
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+
+if (kIsOnKaggle) {
+  # we reduce the training set size to avoid time out
+  set.seed(1)
+  trainIndexes <- createDataPartition(
+    y = X[["trip_duration"]], p = 0.1, list = FALSE) 
+  X <- X[trainIndexes, ]
+  rm(trainIndexes)
+}
+
+train <- as.h2o(X)
+```
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+predictors <- setdiff (names(X), c(toIgnore))
+```
+
+## Autoencoder (Diabolo Network)
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+if (kIsOnKaggle) {
+  hyperParamsAutoencoder = list( 
+    hidden = list(c(8, 4, 8), c(8, 3, 8), c(7, 3, 7), c(6, 3, 6)),
+    activation = c("Tanh"))
+} else {
+  hyperParamsAutoencoder = list( 
+    hidden = list(c(11, 8, 11), c(10, 8, 10), c(9, 5, 9), c(8, 5, 8), 
+                  c(7, 5, 7), c(6, 5, 6), c(11, 7, 11), c(10, 7, 10), 
+                  c(9, 4, 9), c(8, 4, 8), c(7, 4, 7), c(6, 4, 6), 
+                  c(11, 6, 11), c(10, 6, 10), c(9, 3, 9), c(8, 3, 8), 
+                  c(7, 3, 7), c(6, 3, 6), c(11, 5, 11), c(10, 5, 10),
+                  c(11, 4, 11), c(10, 4, 10), c(11, 8, 5, 8, 11)),
+    activation = c("Tanh"))
+}
+
+gridAutoencoder <- h2o.grid(
+  x = predictors,
+  autoencoder = TRUE,
+  training_frame = train,
+  hyper_params = hyperParamsAutoencoder,
+  search_criteria = list(strategy = "Cartesian"),
+  algorithm = "deeplearning",
+  grid_id = "grid_autoencoder", 
+  reproducible = TRUE, 
+  seed = 1,
+  variable_importances = TRUE,
+  categorical_encoding = "AUTO",
+  score_interval = 2,
+  epochs = 800,
+  adaptive_rate = TRUE,
+  standardize = TRUE,
+  ignore_const_cols = FALSE)
+```
+
+```{r include=FALSE}
+rm (hyperParamsAutoencoder)
+```
+
+The following table summarizes the grid results (it is sorted increasingly by 'mse'):
+```{r echo=FALSE}
+sortedGridAutoencoder <- h2o.getGrid("grid_autoencoder", 
+                                     sort_by = "mse", decreasing = FALSE)
+tmpDf <- as.data.frame(sortedGridAutoencoder@summary_table)
+knitr::kable(head(tmpDf[, -grep("model_ids", colnames(tmpDf))]), row.names = TRUE)
+rm(tmpDf)
+```
+
+```{r include=FALSE}
+bestAutoencoder <- h2o.getModel(sortedGridAutoencoder@model_ids[[1]])
+
+bestAutoencoderErr <- as.data.frame(h2o.anomaly(bestAutoencoder, 
+                                                train, 
+                                                per_feature = FALSE))
+```
+
+Considering the "best" autoencoder (i.e., the one with the lowest 'mse', which is the one with the hidden layers [`r bestAutoencoder@parameters$hidden`]), the two following figures illustrate the fact that it performs rather well; only a limited portion of the input signal could not be reconstructed. 
+
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=10, fig.height=3.5}
+plotReconstructionError <- function (error) {
+  cut <- 0.5 * sd(error)
+  sortedErr <- sort(error)
+  sortedErrFrame <- data.frame (index = seq(0, length(sortedErr)-1), error = sortedErr)
+  ylim <- c(min(sortedErrFrame$error), max(sortedErrFrame$error))
+  xlim <- c(min(sortedErrFrame$index), max(sortedErrFrame$index))
+  # could do as in https://stackoverflow.com/questions/11838278/plot-with-conditional-colors-based-on-values-in-r
+  plot (x = sortedErrFrame$index[which(sortedErrFrame$error <= cut)], 
+        y = sortedErrFrame$error[which(sortedErrFrame$error <= cut)], 
+        type = "o", col="forestgreen", lwd=1, ylim = ylim, xlim = xlim, ylab="mse",
+        main = "Reconstruction Error",
+        xlab = "Sorted Index")
+  par(new=TRUE)
+  plot (x = sortedErrFrame$index[which(sortedErrFrame$error > cut)], 
+        y = sortedErrFrame$error[which(sortedErrFrame$error > cut)],  
+        type = "o", col="firebrick3", xaxt='n', yaxt='n', ann=FALSE, ylim = ylim, xlim = xlim, xlab="")
+  return (0)
+}
+
+layout(matrix(c(1,2,2), 1, 3, byrow = TRUE))
+plotReconstructionError (bestAutoencoderErr$Reconstruction.MSE)
+
+# https://stackoverflow.com/questions/21858394/partially-color-histogram-in-r
+h <- hist(x = bestAutoencoderErr$Reconstruction.MSE, breaks = 100, plot = FALSE)
+cuts <- cut(h$breaks, c(-Inf, 0.5 * sd(bestAutoencoderErr$Reconstruction.MSE), Inf))
+plot(h, col = c("forestgreen","firebrick3")[cuts], main = "Reconstruction Error", xlab = "mse", lty="blank")
+rm(h, cuts)
+```
+
+
+## Deep Features Visualization
+
+```{r  include=FALSE}
+plotDeepFeatures <- function(data, maxPlot = 16, ncol = 4) {
+  count <- 1
+  plotList <- list()
+  n <- (ncol(data) - 1)
+  midpoint <- median(data$log_trip_duration)
+  for (i in 1:n) {
+    for (j in 1:n) {
+      if (i == j) {
+        next
+      }
+      plotList[[paste0("p", count)]] <- ggplot(
+        data, 
+        aes_string(
+          x = paste0("DF.L", layer, ".C", i), 
+          y = paste0("DF.L", layer, ".C", j), 
+          color = "log_trip_duration")) +
+        geom_point(alpha = 0.9, aes(colour = log_trip_duration)) +
+        #scale_colour_gradient2(midpoint = midpoint) + 
+        #scale_colour_gradientn(colours = terrain.colors(10)) +
+        #scale_colour_gradientn(colours = topo.colors(10)) +
+        #scale_colour_gradientn(colours = rev(rainbow(10))) +
+        scale_colour_gradientn(colours = rev(rainbow(10)[1:8])) +
+        theme(legend.position = 
+                ifelse(count == min((n-1)*n, maxPlot), "right", "none")) +     
+        labs(color="log(t)")
+      
+      count <- count + 1
+      if (count > maxPlot) {
+        break
+      }
+    }
+    if (count > maxPlot) {
+      break
+    }
+  }
+  grid.arrange(grobs = as.list(plotList), ncol = ncol)
+}
+```
+
+
+### Second Layer
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+layer <- 2
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+deepFeature2 <- h2o.deepfeatures(bestAutoencoder, train, layer = layer)
+```
+
+```{r echo=TRUE, warning=FALSE, results='show', message=FALSE}
+data <- as.data.frame(deepFeature2)
+data$log_trip_duration <- log(X$trip_duration)
+
+summary(data)
+```
+
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=10, fig.height=5}
+plotDeepFeatures(data, 8)
+```
+  
+### Third Layer
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+layer <- 3
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+deepFeature3 <- h2o.deepfeatures(bestAutoencoder, train, layer = layer)
+```
+
+```{r echo=TRUE, warning=FALSE, results='show', message=FALSE}
+data <- as.data.frame(deepFeature3)
+data$log_trip_duration <- log(X$trip_duration)
+
+summary(data)
+```
+
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=10, fig.height=10}
+plotDeepFeatures(data, 16)
+```

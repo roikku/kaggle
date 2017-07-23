@@ -1,0 +1,328 @@
+---
+title: 'Simplistic Approach Using XGBoost'
+author: 'Loic Merckel'
+date: '21 July 2017'
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    highlight: tango
+    theme: cosmo
+    smart: true
+---
+
+<style type="text/css">
+  h1.title { font-weight: bold; } h1 { font-weight: normal; } .author { font-weight: normal; font-size: 1.5em; }
+</style>
+
+
+```{r include=FALSE}
+# License -----------------
+
+# Copyright 2017 Loic Merckel
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+# http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+```
+
+We present a brief solution to the problem of predicting the course duration. We rely on [XGBoost](http://xgboost.readthedocs.io/en/latest/) for the GBM training, in concert with the [caret package](http://topepo.github.io/caret/index.html) for both grid search and cross-validation. Besides, we use `data.table` in lieu of `data.frame` to speed up various computations. 
+
+```{r include=FALSE}
+pkgs <- c("corrplot", "caret", "data.table", "plyr",
+          "xgboost", "parallel", "Metrics", "maps", 
+          "ggmap", "lubridate", "fasttime") 
+for (pkg in pkgs) {
+  if (! (pkg %in% rownames(installed.packages()))) { install.packages(pkg) }
+  require(pkg, character.only = TRUE)
+}
+rm(pkgs)
+rm(pkg)
+```
+
+```{r include=FALSE}
+# data ---------------------------
+rm(list=ls(all=TRUE))
+
+kIsOnKaggle <- FALSE
+if (kIsOnKaggle) {
+  X <- fread(file.path("..", "input", "train.csv", fsep = .Platform$file.sep), 
+             header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+  Xt <- fread(file.path("..", "input", "test.csv", fsep = .Platform$file.sep), 
+                header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+} else {
+  X <- fread(file.path(".", "data", "train.csv", fsep = .Platform$file.sep), 
+             header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+  Xt <- fread(file.path(".", "data", "test.csv", fsep = .Platform$file.sep), 
+                header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+}
+kIsOnKaggle <- TRUE
+
+Xt[, trip_duration := NA]
+```
+
+
+```{r include=FALSE}
+isConstant <- function (x) {
+  return(all(duplicated(x)[-1L]))
+}
+
+convertInteger2Numeric <- function (data) {
+  for (c in names (data)) {
+    if (is.integer(data[[c]])) {
+      data[[c]] <- as.numeric(data[[c]])
+    }
+  }
+  return (data)
+}
+```
+
+# Features Tinkering
+
+First, we remove the column `dropoff_datetime`, as otherwise there is no point to predict the duration of the trip... We could just precisely calculate it...
+
+```{r  echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X[, dropoff_datetime := NULL]
+```
+
+```{r include=FALSE}
+toIgnore <- c("id", "trip_duration")
+```
+
+
+## Outliers
+
+### Pickup Location
+
+```{r echo=FALSE, warning=FALSE, results='hide', message=FALSE, out.width ="70%"}
+ggmapSupported <- TRUE
+tryCatch({
+map <- get_map(
+  location = c(lon = median(X$pickup_longitude), 
+               lat = 40.65), #median(X$pickup_latitude)
+  zoom = 11)
+
+outliers <- which(X$pickup_longitude > -74
+                  & X$pickup_latitude < 40.57)
+
+set.seed(1)
+nonOutlierSample <- sample(setdiff(seq(1, nrow(X)), outliers), 1000)
+
+ggmap(map) + 
+  geom_point(data = X[outliers, ],
+             aes(x = pickup_longitude, 
+                 y = pickup_latitude), color = "red", size = 4) + 
+  geom_point(data = X[nonOutlierSample, ],
+             aes(x = pickup_longitude, 
+                 y = pickup_latitude), color = "blue", size = 4, shape = 1)
+}, error = function(e) {
+  print (e)
+  ggmapSupported <<- FALSE
+})
+```
+
+`r if(!ggmapSupported) {"<img src=\"https://raw.githubusercontent.com/roikku/kaggle/master/taxi/img/map.png\" width=\"70%\"/>"}`
+
+There seems to be some outliers in the dataset. Let's remove *some* of them (obvioulsy, a better way should be devised here, for the current naive implementation misses some outliers while removing some non-outliers).
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X <- X[-which(X$pickup_longitude > -74
+             & X$pickup_latitude < 40.57), ]
+Xt <- Xt[-which(Xt$pickup_longitude > -74
+               & Xt$pickup_latitude < 40.57), ]
+```
+
+```{r include=FALSE}
+rm(map, outliers, nonOutlierSample)
+```
+
+
+### Trip Duration
+
+```{r include=FALSE}
+showOutliers <- function (X, column, maxVal, histTitle) {
+  # with outlier
+  opar <- par(fig=c(0, 0.5, 0, 0.8))
+  hist(x = X[[column]], breaks = 100, col = "forestgreen", plot = TRUE, xlab = column, 
+       main = NULL)
+  par(fig=c(0, 0.5, 0.50, 1), new = TRUE)
+  boxplot(X[[column]], col = "forestgreen", outcol="firebrick4", horizontal = TRUE, axes = FALSE)
+  mtext("With outliers", outer = FALSE, line=0)
+  
+  # without outlier
+  par(fig=c(0.5, 1, 0, 0.8), new = TRUE)
+  hist(x = X[-which(X[[column]] > maxVal), ][[column]], breaks = 100, col = "forestgreen", plot = TRUE, xlab = column, 
+       main = NULL)
+  par(fig=c(0.5, 1, 0.50, 1), new = TRUE)
+  boxplot(X[-which(X[[column]] > maxVal), ][[column]], col = "forestgreen", outcol="firebrick4", horizontal = TRUE, axes = FALSE)
+  mtext("Without outliers", outer = FALSE, line=0)
+  title(histTitle, outer = TRUE, line=-2)
+  par (opar)
+  return (0)
+}
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE, fig.width=10, fig.height=5}
+# outliers (Hampel's test)
+maxThreshold <- 3 * 1.48 * mad(X$trip_duration, na.rm = TRUE) 
+                    + median(X$trip_duration, na.rm = TRUE)  
+showOutliers(X, "trip_duration", maxThreshold, "Distribution of Trip Duration")
+```
+
+We rely on the Hampel's test to compute the maximum threshold above which values are declared spurious. One can find further details about the Hampel's test for outlier detection in *[Scrub data with scale-invariant nonlinear digital filters](http://m.eet.com/media/1140823/191159.pdf)*.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X <- X[-which(X$trip_duration > maxThreshold), ]
+```
+
+```{r include=FALSE}
+rm(maxThreshold)
+```
+
+
+## Pickup Date
+
+We add the two new features `wday` and `hour`.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X[, pickup_datetime := fastPOSIXct (pickup_datetime)]
+X[, wday := wday(pickup_datetime)]
+X[, hour := hour (pickup_datetime)]
+
+Xt[, pickup_datetime := fastPOSIXct (pickup_datetime)]
+Xt[, wday := wday(pickup_datetime)]
+Xt[, hour := hour (pickup_datetime)]
+```
+
+```{r include=FALSE}
+toIgnore <- c(toIgnore, c("pickup_datetime"))
+```
+
+## Correlations Between Numerical Columns 
+
+```{r include=FALSE}
+numVal <- c()
+nonNumVal <- c()
+for (feature in colnames(X)) {
+  if (feature %in% toIgnore) {
+    next
+  }
+  if (class(X[[feature]]) %in% c("integer", "numeric")) {
+    if (sd(X[[feature]]) == 0) {
+      toIgnore <- c(toIgnore, feature)
+    } else {
+      numVal <- c(feature, numVal)
+    }
+  } else {
+    nonNumVal <- c(feature, nonNumVal)
+  }
+}
+rm(feature)
+```
+
+There is `r length(nonNumVal)` categorical variables, and there are `r length(numVal)` numerical variables with non-null standard deviation. 
+
+
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=7, fig.height=7, fig.align = "center"}
+set.seed(1)
+correlations <- cor(X[, setdiff(numVal, toIgnore), with = FALSE], use="everything")
+corrplot(correlations, method="circle", type="lower",  
+         sig.level = 0.01, insig = "blank", tl.cex = 0.7)
+rm(correlations, numVal, nonNumVal)
+```
+
+
+## Convert Categorical Variables to Numerical
+
+```{r echo=TRUE, warning=FALSE, message=FALSE}
+X[, store_and_fwd_flag := ifelse (store_and_fwd_flag == "N", 0, 1)]
+Xt[, store_and_fwd_flag := ifelse (store_and_fwd_flag == "N", 0, 1)]
+```
+
+```{r include=FALSE}
+response <- "trip_duration"
+
+train <- convertInteger2Numeric(X)
+test <- convertInteger2Numeric(Xt)
+```
+
+# Gradient Boosting Machine 
+
+The predictors are *`r paste0(setdiff(names(X), toIgnore), collapse = ", ")`*; we ignore the columns *`r paste0(toIgnore, collapse = ", ")`* (`toIgnore`).
+
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+indexToIgnoreTrain <- which (names(train) %in% toIgnore)
+indexToIgnoreTest <- which (names(test) %in% toIgnore)
+```
+
+Due to severe limitations in computational resources, the grid only spans very narrow ranges for hyper-parameters (consequently, we might very well miss more adequate settings). The situation is even worse on Kaggle (a 2-folds cross-validation with a one-row grid reaches the time out; hence the only one row grid below, the only 2-folds and the significantly reduced train set---it is still useful for when the script is executed on a decent machine, it is easy to expend the grid).
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+if (kIsOnKaggle) {
+  xgbGrid <- expand.grid(
+    nrounds = c(600),
+    eta = c(0.01),
+    max_depth = c(4), 
+    gamma = 0, 
+    colsample_bytree = c(0.8),  
+    min_child_weight = c(3), 
+    subsample = c(0.7)) 
+  
+  # we reduce the training set size to avoid time out
+  set.seed(1)
+  trainIndexes <- createDataPartition(y = X[[response]], p = 0.1, list = FALSE) 
+  train <- train[trainIndexes, ]
+} else {
+  xgbGrid <- expand.grid(
+    nrounds = seq(400, 1200, 50),
+    eta = seq(0, 0.02, 0.01),
+    max_depth = c(3, 4, 5, 6, 7, 8, 9, 10), 
+    gamma = c(0, 1, 5, 10, 15), 
+    colsample_bytree = c(0.75, 1),  
+    min_child_weight = c(1, 2, 3), 
+    subsample = c(0.7, 1))  
+}
+
+xgbTrControl <- trainControl(
+  method = "cv",
+  number = ifelse(kIsOnKaggle, 2, 8),
+  verboseIter = TRUE,
+  returnResamp = "final",                                                       
+  allowParallel = TRUE)
+
+set.seed(1)
+xgbModel <- train(
+  x = data.matrix(train[, -indexToIgnoreTrain, with = FALSE]),
+  y = train[[response]],
+  trControl = xgbTrControl,
+  tuneGrid = xgbGrid,
+  method = "xgbTree",
+  metric = "RMSE")
+```
+
+Summary of the training:
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+xgbModel
+```
+
+A more extensive grid search could lead to improved performances, but we are quite limited in computational resources...
+
+We can submit to Kaggle's LB to see how well this model performs on the test set.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+result <- predict(xgbModel, data.matrix(test[, -indexToIgnoreTest, with = FALSE]))
+
+fwrite(data.table(id = Xt$id, trip_duration = result), 
+       file = file.path(".", paste0("output-", Sys.Date(), ".csv"), 
+                        fsep = .Platform$file.sep), 
+       row.names = FALSE,  quote = FALSE)
+```
