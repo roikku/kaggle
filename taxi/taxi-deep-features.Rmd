@@ -60,10 +60,15 @@ kIsOnKaggle <- FALSE
 if (kIsOnKaggle) {
   X <- fread(file.path("..", "input", "train.csv", fsep = .Platform$file.sep), 
              header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+  Xt <- fread(file.path("..", "input", "test.csv", fsep = .Platform$file.sep), 
+             header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
 } else {
   X <- fread(file.path(".", "data", "train.csv", fsep = .Platform$file.sep), 
              header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+  Xt <-  fread(file.path(".", "data", "test.csv", fsep = .Platform$file.sep), 
+             header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
 }
+Xt[, trip_duration := NA]
 ```
 
 
@@ -131,6 +136,11 @@ X <- X[-which(X$pickup_longitude > -74
 ```
 
 ```{r include=FALSE}
+Xt <- Xt[-which(Xt$pickup_longitude > -74
+             & Xt$pickup_latitude < 40.57), ]
+```
+
+```{r include=FALSE}
 rm(map, outliers, nonOutlierSample)
 ```
 
@@ -187,6 +197,12 @@ X[, hour := hour(pickup_datetime)]
 ```
 
 ```{r include=FALSE}
+Xt[, pickup_datetime := fastPOSIXct (pickup_datetime)]
+Xt[, wday := wday(pickup_datetime)]
+Xt[, hour := hour(pickup_datetime)]
+```
+
+```{r include=FALSE}
 toIgnore <- c(toIgnore, c("pickup_datetime"))
 ```
 
@@ -218,6 +234,9 @@ There is `r length(nonNumVal)` categorical variables, and there are `r length(nu
 X[, store_and_fwd_flag := ifelse (store_and_fwd_flag == "N", 0, 1)]
 ```
 
+```{r include=FALSE}
+Xt[, store_and_fwd_flag := ifelse (store_and_fwd_flag == "N", 0, 1)]
+```
 
 # Deep Features
 
@@ -246,6 +265,7 @@ h2o.clusterStatus()
 # and we do not really need this column any longer (wday and hour are used instead)
 
 X[, pickup_datetime := NULL]
+Xt[, pickup_datetime := NULL]
 ```
 
 ```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
@@ -440,4 +460,109 @@ summary(data)
 
 ```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=10, fig.height=10}
 plotDeepFeatures(data, 16)
+```
+
+# Predictions Using Deep Features and GBM
+
+```{r include=FALSE}
+test <- as.h2o(Xt)
+```
+
+## Get Deep Features & Split Data
+
+We use the second layer of the autocencoder.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+layer <- 2
+deepFeatureTrain <- h2o.deepfeatures(bestAutoencoder, train, layer = layer)
+deepFeatureTrain[["trip_duration"]] <- as.h2o(X$trip_duration)
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+splits <- h2o.splitFrame(
+  data = deepFeatureTrain, 
+  ratios = c(0.7),
+  seed = 1
+)
+trainDf <- splits[[1]]
+validDf <- splits[[2]]
+```
+
+## Grid Search
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+deepfeatures <- setdiff(names(deepFeatureTrain), c("trip_duration"))
+
+if (kIsOnKaggle) {
+  hyperParamsGbm <- list(
+    max_depth = c(3, 4),
+    min_split_improvement = c(0, 1e-6))
+} else {
+  hyperParamsGbm <- list( 
+    max_depth = seq(3, 15, 2),
+    sample_rate = seq(0.2, 1, 0.01),
+    col_sample_rate_per_tree = seq(0.2, 1, 0.01),
+    col_sample_rate_change_per_level = seq(0.6, 1.4, 0.02),
+    min_rows = 2^seq(0, log2(nrow(train))-3, 1),
+    nbins = 2^seq(2, 10, 1),
+    nbins_cats = 2^seq(1, 4, 1),
+    histogram_type = c("UniformAdaptive", "QuantilesGlobal", "RoundRobin") ,
+    distribution=c("bernoulli", "multinomial"),
+    min_split_improvement = c(0, 1e-8, 1e-6, 1e-4))
+} 
+  
+gridGbm <- h2o.grid(
+  hyper_params = hyperParamsGbm,
+  search_criteria = list(strategy = "Cartesian"),
+  algorithm = "gbm",
+  grid_id = "grid_gbm", 
+  x = deepfeatures, 
+  y = "trip_duration", 
+  training_frame = trainDf, 
+  validation_frame = validDf,
+  nfolds = 0,
+  ntrees = ifelse(kIsOnKaggle, 200, 1000),                                        
+  learn_rate = 0.05,                                                         
+  learn_rate_annealing = 0.99,                                               
+  max_runtime_secs = ifelse(kIsOnKaggle, 120, 3600),                              
+  stopping_rounds = 5, 
+  stopping_tolerance = 1e-5, 
+  stopping_metric = "MSE", 
+  score_tree_interval = 10,                                                
+  seed = 1,
+  fold_assignment = "AUTO",
+  keep_cross_validation_predictions = FALSE)
+
+sortedGridGbm <- h2o.getGrid("grid_gbm", sort_by = "mse", decreasing = TRUE)
+```
+
+```{r echo=FALSE}
+tmpDf <- as.data.frame(sortedGridGbm@summary_table)
+knitr::kable(head(tmpDf[, -grep("model_ids", colnames(tmpDf))]), row.names = TRUE)
+rm(tmpDf)
+```
+
+## Best Model & Performance on the Validation Set
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+bestGbmModel <- h2o.getModel(sortedGridGbm@model_ids[[1]])
+perf <- h2o.performance(bestGbmModel, newdata = validDf)
+```
+
+```{r echo=FALSE, warning=FALSE, results='show', message=FALSE}
+perf
+```
+
+## Test Set & Submission
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+deepFeatureTest <- h2o.deepfeatures(bestAutoencoder, test, layer = layer)
+deepFeatureTest[["trip_duration"]] <- as.h2o(Xt$trip_duration)
+
+pred <- h2o.predict (bestGbmModel, newdata = deepFeatureTest)
+
+fwrite(data.table(id = Xt$id, trip_duration = as.vector(pred$predict)), 
+       file = file.path(".", paste0("output-gbm-", Sys.Date(), ".csv"), 
+                        fsep = .Platform$file.sep), 
+       row.names = FALSE,  quote = FALSE)
 ```
