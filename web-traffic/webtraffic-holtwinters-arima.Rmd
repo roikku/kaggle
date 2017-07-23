@@ -1,0 +1,210 @@
+---
+title: 'Preliminary Investigation: HoltWinters & ARIMA'
+author: 'Loic Merckel'
+date: '15 July 2017'
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    highlight: tango
+    theme: cosmo
+    smart: true
+---
+
+<style type="text/css">
+  h1.title { font-weight: bold; } h1 { font-weight: normal; } .author { font-weight: normal; font-size: 1.5em; }
+</style>
+
+
+```{r include=FALSE}
+# Copyright 2017 Loic Merckel
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+# http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+```
+
+Here we present a very simplistic, to the point of being rather naive, approach to this problem. Some aspects of dealing with time series in R are from *[A Little Book of R For Time Series](https://media.readthedocs.org/pdf/a-little-book-of-r-for-time-series/latest/a-little-book-of-r-for-time-series.pdf)*. Each row (i.e., page) is considered individually, which might fail to capture correlations and other interactions between pages.
+
+
+# Forecasting Web Traffic for the Entire Data Set
+
+```{r include=FALSE}
+pkgs <- c("data.table", "TTR", "forecast", "imputeTS") 
+for (pkg in pkgs) {
+  if (! (pkg %in% rownames(installed.packages()))) { install.packages(pkg) }
+  require(pkg, character.only = TRUE)
+}
+rm(pkgs)
+rm(pkg)
+```
+
+```{r include=FALSE}
+rm(list=ls(all=TRUE))
+kIsOnKaggle <- FALSE
+if (kIsOnKaggle) {
+  X <- fread(file.path("..", "input", "train_1.csv", fsep = .Platform$file.sep), 
+             header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+  keys <- fread(file.path("..", "input", "key_1.csv", fsep = .Platform$file.sep), 
+                header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+} else {
+  X <- fread(file.path(".", "data", "train_1.csv", fsep = .Platform$file.sep), 
+             header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+  keys <- fread(file.path(".", "data", "key_1.csv", fsep = .Platform$file.sep), 
+                header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
+}
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=9}
+setnames(keys, "Page", "PageWithDate")
+n <- nchar("_0000-00-00")
+keys[, Page := substr(PageWithDate, 0, nchar(PageWithDate) - n)]
+keys[, Date := substr(PageWithDate, nchar(PageWithDate) - n + 2, nchar(PageWithDate))]
+rm (n)
+
+# 1: ARIMA or 2: HoltWinters
+kMethod <- 2
+kH <- 31 + 28 + 1 # from Jan 1, 2017 to Mar 1, 2017
+kUseTsClean <- TRUE
+kSmoothOrder <- 0 # no smoothing if <= 0
+
+i <- 1
+forecastWebTraffic <- function(x) {
+  row <- unname(unlist(x))
+
+  predictions <- tryCatch({
+    if (kUseTsClean) {
+      rowTs <- tsclean(ts(row, frequency = 365.25, start = c(2015, 7, 1)))
+    } else {
+      # outliers (Hampel's test)
+      minMaxThreshold <- 3 * c(-1, 1) * 1.48 * mad(row, na.rm = TRUE) + median(row, na.rm = TRUE)  
+      row[row < minMaxThreshold[1]] <- NA 
+      row[row > minMaxThreshold[2]] <- NA 
+      
+      # missing values
+      rowTs <- ts(row, frequency = 365.25, start = c(2015, 7, 1))
+      if (anyNA(rowTs)) {
+        rowTs <- na.interpolation(rowTs, option = "spline")
+      }
+    }
+    if (kSmoothOrder > 0) {
+      smoothed <- ma(rowTs, order = kSmoothOrder)
+      indexes <- (kSmoothOrder %/% 2 + 1):(length(rowTs) - (kSmoothOrder %/% 2 + 1))
+      rowTs[indexes] <- smoothed[indexes]
+      rm(smoothed, indexes)
+    }
+    
+    # predictions
+    if (kMethod == 1) {
+      fit <- auto.arima(rowTs)
+    } else {
+      fit <- HoltWinters(rowTs, beta = FALSE, gamma = FALSE)
+    }
+    predictions <- forecast(fit, h = kH, fan = TRUE)
+  }, error = function(e) {
+    predictions <- data.frame(mean = rep(0, kH))
+  })
+  
+  if (i %% 500) {
+    cat('\r')
+    cat(paste0(round(i / nrow(X) * 100), "% completed"))
+  }
+  i <<- i + 1
+
+  if (kIsOnKaggle && i == 100) {
+    stop("Stop execution to prevent time out on Kaggle", call. = FALSE)
+  }
+  
+  return (as.list (as.numeric(predictions$mean)))
+}
+
+vars <- names(X[, -1])
+try(X[, c(unique(keys$Date)) := forecastWebTraffic (.SD), .SDcols = vars, by = 1:nrow(X)])
+
+meltX <- melt(
+  X[, which(names(X) %in% c(unique(keys$Date), "Page")), with = FALSE], 
+  measure.vars = unique(keys$Date), 
+  variable.name = "Date", 
+  value.name = "Visits")
+meltX$Date <- as.character(meltX$Date)
+
+mergeKeysMeltX <- merge(keys, meltX, by=c("Page", "Date"), all.x = TRUE)
+
+fwrite(mergeKeysMeltX[, c("Id", "Visits")], 
+       file=file.path(".", paste0("output-", ifelse(kMethod == 1, "arima", "holtwinters"), ".csv"), fsep = .Platform$file.sep), 
+       row.names = FALSE,  quote = FALSE)
+```
+
+One can find further details about the Hampel's test for outlier detection in *[Scrub data with scale-invariant nonlinear digital filters](http://m.eet.com/media/1140823/191159.pdf)*.
+
+
+# HoltWinters Illustration with a Single Page
+
+```{r include=FALSE}
+rowIndex <- 1000
+```
+
+Here we consider the page *`r unname(unlist(X[rowIndex, 1, with = FALSE]))`*.
+
+```{r include=FALSE}
+removeOutliersAndImputNa <- function (row) {
+  # outliers (Hampel's test)
+  minMaxThreshold <- 3 * c(-1, 1) * 1.48 * mad(row, na.rm = TRUE) + median(row, na.rm = TRUE)  
+  row[row < minMaxThreshold[1]] <- NA 
+  row[row > minMaxThreshold[2]] <- NA 
+  
+  # missing values
+  rowTs <- ts(row, frequency = 365.25, start = c(2015, 7, 1))
+  if (anyNA(rowTs)) {
+    rowTs <- na.interpolation(rowTs, option = "spline")
+  }
+  return (rowTs)
+}
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=9}
+row <- unname(unlist(X[rowIndex, -1, with = FALSE]))
+rowTs <- removeOutliersAndImputNa (row)
+fit <- HoltWinters(rowTs, beta = FALSE, gamma = FALSE)
+predictions <- forecast(fit, h = kH, fan = TRUE)
+```
+
+```{r echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=4}
+plot(fit)
+```
+
+```{r echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=4}
+plot(predictions)
+```
+
+# ARIMA Illustration with a Single Page
+
+```{r include=FALSE}
+rowIndex <- 100
+set.seed(1)
+```
+
+Here we consider the page *`r unname(unlist(X[rowIndex, 1, with = FALSE]))`*.
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=9}
+row <- unname(unlist(X[rowIndex, -1, with = FALSE]))
+rowTs <- removeOutliersAndImputNa (row)
+fit <- auto.arima(rowTs)
+predictions <- forecast(fit, h = kH, fan = TRUE)
+```
+
+```{r echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=4}
+plot(fit)
+```
+
+```{r echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=4}
+plot(predictions)
+```
