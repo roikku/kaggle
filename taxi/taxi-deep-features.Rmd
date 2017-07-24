@@ -462,6 +462,10 @@ summary(data)
 plotDeepFeatures(data, 16)
 ```
 
+```{r include=FALSE}
+rm (deepFeature2, deepFeature3, data)
+```
+
 # Predictions Using Deep Features and GBM
 
 ```{r include=FALSE}
@@ -506,8 +510,7 @@ if (kIsOnKaggle) {
     min_rows = 2^seq(0, log2(nrow(train))-3, 1),
     nbins = 2^seq(2, 10, 1),
     nbins_cats = 2^seq(1, 4, 1),
-    histogram_type = c("UniformAdaptive", "QuantilesGlobal", "RoundRobin") ,
-    distribution=c("bernoulli", "multinomial"),
+    histogram_type = c("UniformAdaptive", "QuantilesGlobal", "RoundRobin"),
     min_split_improvement = c(0, 1e-8, 1e-6, 1e-4))
 } 
   
