@@ -64,7 +64,6 @@ if (kIsOnKaggle) {
   Xt <- fread(file.path(".", "data", "test.csv", fsep = .Platform$file.sep), 
                 header = TRUE, data.table = TRUE, na.strings=c("NA","?", ""))
 }
-kIsOnKaggle <- TRUE
 
 Xt[, trip_duration := NA]
 ```
@@ -136,8 +135,6 @@ There seems to be some outliers in the dataset. Let's remove *some* of them (obv
 ```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
 X <- X[-which(X$pickup_longitude > -74
              & X$pickup_latitude < 40.57), ]
-Xt <- Xt[-which(Xt$pickup_longitude > -74
-               & Xt$pickup_latitude < 40.57), ]
 ```
 
 ```{r include=FALSE}
@@ -193,11 +190,11 @@ rm(maxThreshold)
 We add the two new features `wday` and `hour`.
 
 ```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
-X[, pickup_datetime := fastPOSIXct (pickup_datetime)]
+X[, pickup_datetime := fastPOSIXct (pickup_datetime, tz = "EST")]
 X[, wday := wday(pickup_datetime)]
 X[, hour := hour (pickup_datetime)]
 
-Xt[, pickup_datetime := fastPOSIXct (pickup_datetime)]
+Xt[, pickup_datetime := fastPOSIXct (pickup_datetime, tz = "EST")]
 Xt[, wday := wday(pickup_datetime)]
 Xt[, hour := hour (pickup_datetime)]
 ```

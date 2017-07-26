@@ -34,16 +34,22 @@ output:
 # limitations under the License.
 ```
 
-We use the autoencoder and deeplearning capability of the  [H<small>2</small>O](https://www.h2o.ai/) framework to explore deep features. 
+In this tutorial-like *kernel*, we use the autoencoder and deeplearning capability of the  [H<small>2</small>O](https://www.h2o.ai/) framework to explore deep features. 
 
-Such an approach provides a means of reducing features (although here there is no need, for the number of features is already small). 
+Such an approach provides a means of reducing features[^1] (although here there is no need, for the number of features is already small). 
 
-It also offers a way to leverage unlabelled data---a technique called semi-supervised learning. The kernels *[Diabolo Trick: Pre-train, Train and Solve](https://goo.gl/JXxc6n)* gives a concrete example.
+It also offers a way to leverage unlabelled data---a technique called semi-supervised learning. The kernel *[Diabolo Trick: Pre-train, Train and Solve](https://goo.gl/JXxc6n)* gives a concrete example.
+
+Finally, it is perhaps worth noting that deep features are the backbone of some *transfer learning* techniques.
+
+[^1]: Hinton, Geoffrey E., and Ruslan R. Salakhutdinov. "[Reducing the dimensionality of data with neural networks.](http://science.sciencemag.org/content/313/5786/504)" science 313.5786 (2006): 504-507. ([pdf](https://www.cs.toronto.edu/~hinton/science.pdf))
+
 
 ```{r include=FALSE}
 pkgs <- c("corrplot", "caret", "data.table", "plyr",
           "xgboost", "parallel", "Metrics", "maps", 
-          "ggmap", "lubridate", "fasttime", "gridExtra") 
+          "ggmap", "lubridate", "fasttime", "gridExtra", 
+          "geosphere") 
 for (pkg in pkgs) {
   if (! (pkg %in% rownames(installed.packages()))) { install.packages(pkg) }
   require(pkg, character.only = TRUE)
@@ -136,11 +142,6 @@ X <- X[-which(X$pickup_longitude > -74
 ```
 
 ```{r include=FALSE}
-Xt <- Xt[-which(Xt$pickup_longitude > -74
-             & Xt$pickup_latitude < 40.57), ]
-```
-
-```{r include=FALSE}
 rm(map, outliers, nonOutlierSample)
 ```
 
@@ -186,25 +187,104 @@ X <- X[-which(X$trip_duration > maxThreshold), ]
 rm(maxThreshold)
 ```
 
+## Locations and Distances
+
+We assume that the earth's surface forms a perfect sphere; so that we can conveniently use the [haversine formula](https://en.wikipedia.org/wiki/Haversine_formula) to estimate each trip **distance as the crow flies**. (This distance should constitute a rough estimation of the covered distance; at least it gives a minimum.)
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+X[, distance_as_the_crow_flies := distHaversine(data.table(pickup_longitude, pickup_latitude),
+              data.table(dropoff_longitude, dropoff_latitude))]
+                  
+Xt[, distance_as_the_crow_flies := distHaversine(data.table(pickup_longitude, pickup_latitude),
+              data.table(dropoff_longitude, dropoff_latitude))]
+```                  
+
+
+```{r include=FALSE}
+# moothing method (function) to use, eg. "lm", "glm", "gam", "loess", "rlm".
+showScattered <- function (X, col1, col2, title = NULL, method = "loess") {
+  data <- setNames(data.frame(X[[col1]], X[[col2]]), c(col1, col2))
+  if (is.null(title)) {
+    ggplot(data, aes_string(x=col1, y=col2)) +
+      geom_point(shape=1) +    
+      geom_smooth(method = method)
+  } else {
+    ggplot(data, aes_string(x=col1, y=col2)) +
+      geom_point(shape=1) +    
+      geom_smooth(method = method)+
+      labs(title = title)
+  }
+}
+```
+ 
+           
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=4}
+set.seed(1)
+showScattered(X[sample(seq_len(nrow(X)), 10000), ], 
+  "distance_as_the_crow_flies", "trip_duration", title = NULL)
+```       
+
+
 ## Pickup Date
 
 We add the two new features `wday` and `hour`.
 
 ```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
-X[, pickup_datetime := fastPOSIXct (pickup_datetime)]
+X[, pickup_datetime := fastPOSIXct (pickup_datetime, tz = "EST")]
 X[, wday := wday(pickup_datetime)]
-X[, hour := hour(pickup_datetime)]
+X[, hour := hour (pickup_datetime)]
+
+Xt[, pickup_datetime := fastPOSIXct (pickup_datetime, tz = "EST")]
+Xt[, wday := wday(pickup_datetime)]
+Xt[, hour := hour (pickup_datetime)]
 ```
 
-```{r include=FALSE}
-Xt[, pickup_datetime := fastPOSIXct (pickup_datetime)]
-Xt[, wday := wday(pickup_datetime)]
-Xt[, hour := hour(pickup_datetime)]
-```
 
 ```{r include=FALSE}
 toIgnore <- c(toIgnore, c("pickup_datetime"))
 ```
+
+```{r include=FALSE}
+data <- X[, .(distance_as_the_crow_flies, wday, hour, trip_duration)]
+
+data[, distance_cat := ifelse(distance_as_the_crow_flies < 4000, 
+                              "shorter_distance", "longer_distance")]
+
+data[, day_type := ifelse(wday %in% c(1, 7), 
+                              "weekend", "week_day")]
+
+dataMelt <- melt(data, measure.vars = c("trip_duration"), value.name = "duration")
+```
+
+```{r echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=4}
+p <- ggplot(dataMelt, aes(x = hour, y = duration, fill = duration))+
+  geom_boxplot(aes(group = hour), outlier.colour = "red", outlier.shape = 1)
+
+p1 <- p + stat_summary(fun.y=mean, 
+                       colour="forestgreen", geom="point", size = 2, show.legend = FALSE)
+
+p2 <- p + facet_grid(distance_cat~.) + 
+  stat_summary(fun.y=mean, 
+               colour="forestgreen", geom="point", size = 2, show.legend = FALSE)
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+We can observe, on the left plot, the presence of *outliers* (red dots)---which markedly shift the mean (green spot) from the median---presumably due to the volatility of the traffic in New York. The right plot contrasts *shorted distances* (arbitrarily chosen as less than 4 Km) with *longer distances*. Outliers appear to merely plague the shorter distances (which is fairly intuitive, especially given that many of the shorter-distance trips appear to be within Manhattan).
+
+```{r echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=9, fig.height=3}
+ggplot(dataMelt, aes(x = hour, y = duration, fill = duration))+
+  geom_boxplot(aes(group = hour), outlier.colour = "red", outlier.shape = 1) + facet_grid(.~day_type) + 
+  stat_summary(fun.y=mean, 
+               colour="forestgreen", geom="point", size = 2, show.legend = FALSE)
+```
+
+The plot above suggests that trip durations are longer *late* at night during the weekend, whereas they tend to be longer *early morning* (4~8) during the weekdays (depicting the rush hours of commuters). That sounds rather unsurprising...
+
+```{r include=FALSE}
+rm (data, dataMelt, p1, p2, p)
+```
+
 
 ## Convert Categorical Variables to Numerical
 
@@ -384,12 +464,9 @@ plotDeepFeatures <- function(data, maxPlot = 16, ncol = 4) {
   count <- 1
   plotList <- list()
   n <- (ncol(data) - 1)
-  midpoint <- median(data$log_trip_duration)
-  for (i in 1:n) {
-    for (j in 1:n) {
-      if (i == j) {
-        next
-      }
+  #midpoint <- median(data$log_trip_duration)
+  for (i in 1:(n-1)) {
+    for (j in (i+1):n) {
       plotList[[paste0("p", count)]] <- ggplot(
         data, 
         aes_string(
@@ -437,10 +514,15 @@ data$log_trip_duration <- log(X$trip_duration)
 summary(data)
 ```
 
-```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=10, fig.height=5}
-plotDeepFeatures(data, 8)
+```{r  echo=FALSE, warning=FALSE, results='hide', message=FALSE, fig.width=7.5, fig.height=5}
+plotDeepFeatures(data, 6, 3)
 ```
   
+```{r include=FALSE}
+rm (deepFeature2, data)
+```
+
+
 ### Third Layer
 
 ```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
@@ -463,21 +545,22 @@ plotDeepFeatures(data, 16)
 ```
 
 ```{r include=FALSE}
-rm (deepFeature2, deepFeature3, data)
+rm (deepFeature3, data)
 ```
+
 
 # Predictions Using Deep Features and GBM
 
-```{r include=FALSE}
-test <- as.h2o(Xt)
-```
-
-## Get Deep Features & Split Data
-
-We use the second layer of the autocencoder.
+We use the second layer of the autocencoder (`bestAutoencoder`) and the gradient boosting machine algorithm offered by H<small>2</small>O (`h2o.gbm`). Those are arbitrary choices for the purpose of exemplifying a use of deep features.
 
 ```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
 layer <- 2
+```
+
+
+## Get Deep Features & Split Data
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
 deepFeatureTrain <- h2o.deepfeatures(bestAutoencoder, train, layer = layer)
 deepFeatureTrain[["trip_duration"]] <- as.h2o(X$trip_duration)
 ```
@@ -491,6 +574,7 @@ splits <- h2o.splitFrame(
 trainDf <- splits[[1]]
 validDf <- splits[[2]]
 ```
+
 
 ## Grid Search
 
@@ -545,6 +629,7 @@ knitr::kable(head(tmpDf[, -grep("model_ids", colnames(tmpDf))]), row.names = TRU
 rm(tmpDf)
 ```
 
+
 ## Best Model & Performance on the Validation Set
 
 ```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
@@ -556,16 +641,52 @@ perf <- h2o.performance(bestGbmModel, newdata = validDf)
 perf
 ```
 
+
+## Retrain the Best Model Using the Entire Train Set
+
+Here we use k-folds cross validation to evaluate the final model (trained using the entire train set---i.e., `rbind(trainDf, validDf)`). 
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+nfolds <- ifelse(kIsOnKaggle, 2, 8)
+```
+
+```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
+finalModel <- do.call(h2o.gbm,
+                      {
+                        p <- bestGbmModel@parameters
+                        p$model_id = NULL         
+                        p$training_frame = h2o.rbind(trainDf, validDf)      
+                        p$validation_frame = NULL  
+                        p$nfolds = nfolds               
+                        p
+                      })
+```
+
+```{r echo=TRUE, warning=FALSE, results='show', message=FALSE}
+finalModel@model$cross_validation_metrics_summary
+```
+
+
 ## Test Set & Submission
+
+```{r include=FALSE}
+test <- as.h2o(Xt)
+```
 
 ```{r echo=TRUE, warning=FALSE, results='hide', message=FALSE}
 deepFeatureTest <- h2o.deepfeatures(bestAutoencoder, test, layer = layer)
 deepFeatureTest[["trip_duration"]] <- as.h2o(Xt$trip_duration)
 
-pred <- h2o.predict (bestGbmModel, newdata = deepFeatureTest)
+pred <- h2o.predict (finalModel, newdata = deepFeatureTest)
 
 fwrite(data.table(id = Xt$id, trip_duration = as.vector(pred$predict)), 
        file = file.path(".", paste0("output-gbm-", Sys.Date(), ".csv"), 
                         fsep = .Platform$file.sep), 
        row.names = FALSE,  quote = FALSE)
 ```
+
+
+## Remark
+
+In general, using the top model out of the grid search might not be the wisest approach. Instead, considering the *k* best models might yield improved performances (`k > 1`). An easy way to use *k* models is to average their predicted probabilities. A more sophisticated way consists in using ensemble learning (*super learner*), for which the choice of the meta-learner can help to even further improve the result (e.g., see H<small>2</small>O's documentation on [Stacked Ensembles](http://docs.h2o.ai/h2o/latest-stable/h2o-docs/data-science/stacked-ensembles.html)).
+
