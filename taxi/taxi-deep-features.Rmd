@@ -690,3 +690,7 @@ fwrite(data.table(id = Xt$id, trip_duration = as.vector(pred$predict)),
 
 In general, using the top model out of the grid search might not be the wisest approach. Instead, considering the *k* best models might yield improved performances (`k > 1`). An easy way to use *k* models is to average their predicted probabilities. A more sophisticated way consists in using ensemble learning (*super learner*), for which the choice of the meta-learner can help to even further improve the result (e.g., see H<small>2</small>O's documentation on [Stacked Ensembles](http://docs.h2o.ai/h2o/latest-stable/h2o-docs/data-science/stacked-ensembles.html)).
 
+# Predictions Using Pretrained Neural Networks
+
+This section describes an alternative approach to the previous section and is presented in a dedicated kernel: [Deep Semi-supervised Learning](https://goo.gl/ExSyC2).
+
